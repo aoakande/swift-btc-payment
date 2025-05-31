@@ -7,12 +7,16 @@
 (define-constant ERR-MERCHANT-NOT-FOUND (err u201))
 (define-constant ERR-MERCHANT-ALREADY-EXISTS (err u202))
 (define-constant ERR-INVALID-MERCHANT-DATA (err u203))
+(define-constant ERR-MERCHANT-SUSPENDED (err u204))
+(define-constant ERR-VERIFICATION-PENDING (err u205))
+(define-constant ERR-INVALID-STATUS (err u206))
 (define-constant ERR-INSUFFICIENT-STAKE (err u207))
 
 ;; Merchant status constants
 (define-constant STATUS-PENDING u0)
 (define-constant STATUS-VERIFIED u1)
 (define-constant STATUS-SUSPENDED u2)
+(define-constant STATUS-BANNED u3)
 
 ;; Merchant tier constants
 (define-constant TIER-BASIC u0)
@@ -22,6 +26,7 @@
 ;; Data Variables
 (define-data-var merchant-counter uint u0)
 (define-data-var minimum-stake-amount uint u1000000) ;; 1 STX in microSTX
+(define-data-var verification-fee uint u100000) ;; 0.1 STX in microSTX
 (define-data-var premium-tier-stake uint u10000000) ;; 10 STX for premium
 (define-data-var enterprise-tier-stake uint u50000000) ;; 50 STX for enterprise
 
@@ -39,7 +44,23 @@
     tier: uint,
     stake-amount: uint,
     created-at: uint,
-    last-activity: uint
+    verified-at: (optional uint),
+    last-activity: uint,
+    total-payments: uint,
+    total-volume: uint,
+    reputation-score: uint
+  }
+)
+
+(define-map merchant-settings
+  { merchant-address: principal }
+  {
+    auto-settle: bool,
+    settlement-delay: uint,
+    webhook-url: (optional (string-ascii 256)),
+    notification-email: (optional (string-ascii 64)),
+    custom-fee-rate: (optional uint),
+    payment-timeout: uint
   }
 )
 
@@ -48,13 +69,48 @@
   { staked-amount: uint, stake-locked-until: uint }
 )
 
+(define-map verification-requests
+  { merchant-address: principal }
+  {
+    requested-at: uint,
+    verifier: (optional principal),
+    verified-at: (optional uint),
+    verification-notes: (optional (string-ascii 256)),
+    documents-hash: (optional (buff 32))
+  }
+)
+
 ;; Read-only functions
 (define-read-only (get-merchant (merchant-address principal))
   (map-get? merchants { merchant-address: merchant-address })
 )
 
+(define-read-only (get-merchant-settings (merchant-address principal))
+  (default-to 
+    {
+      auto-settle: true,
+      settlement-delay: u6, ;; 6 blocks default
+      webhook-url: none,
+      notification-email: none,
+      custom-fee-rate: none,
+      payment-timeout: u144 ;; 24 hours in blocks
+    }
+    (map-get? merchant-settings { merchant-address: merchant-address })
+  )
+)
+
 (define-read-only (get-merchant-stake (merchant-address principal))
   (map-get? merchant-stakes { merchant-address: merchant-address })
+)
+
+(define-read-only (is-merchant-active (merchant-address principal))
+  (match (get-merchant merchant-address)
+    merchant (and 
+      (is-eq (get status merchant) STATUS-VERIFIED)
+      (> (get last-activity merchant) (- stacks-block-height u1440)) ;; Active within 10 days
+    )
+    false
+  )
 )
 
 (define-read-only (is-merchant-verified (merchant-address principal))
@@ -71,6 +127,21 @@
       { stake-required: (var-get premium-tier-stake), benefits: "Lower fees, priority support" }
       { stake-required: (var-get enterprise-tier-stake), benefits: "Custom features, dedicated support" }
     )
+  )
+)
+
+
+(define-private (min (a uint) (b uint))
+  (if (< a b) a b)
+)
+
+(define-read-only (calculate-reputation-score (total-payments uint) (total-volume uint) (days-active uint))
+  (let (
+    (payment-score (min (* total-payments u2) u200))
+    (volume-score (min (/ total-volume u1000000) u300))
+    (activity-score (min (* days-active u1) u100))
+  )
+    (+ payment-score volume-score activity-score)
   )
 )
 
@@ -147,7 +218,24 @@
         tier: tier,
         stake-amount: stake-amount,
         created-at: stacks-block-height,
-        last-activity: stacks-block-height
+        verified-at: none,
+        last-activity: stacks-block-height,
+        total-payments: u0,
+        total-volume: u0,
+        reputation-score: u0
+      }
+    )
+    
+    ;; Set default settings
+    (map-set merchant-settings
+      { merchant-address: merchant-address }
+      {
+        auto-settle: true,
+        settlement-delay: u6,
+        webhook-url: none,
+        notification-email: (some contact-email),
+        custom-fee-rate: none,
+        payment-timeout: u144
       }
     )
     
@@ -161,6 +249,107 @@
     })
     
     (ok merchant-id)
+  )
+)
+
+;; Update merchant profile
+(define-public (update-merchant-profile
+  (business-name (string-ascii 64))
+  (business-type (string-ascii 32))
+  (contact-email (string-ascii 64))
+  (website (optional (string-ascii 128)))
+  (description (string-ascii 256))
+)
+  (let (
+    (merchant-address tx-sender)
+    (merchant (unwrap! (get-merchant merchant-address) ERR-MERCHANT-NOT-FOUND))
+  )
+    (asserts! (validate-merchant-data business-name business-type contact-email) ERR-INVALID-MERCHANT-DATA)
+    (asserts! (not (is-eq (get status merchant) STATUS-BANNED)) ERR-MERCHANT-SUSPENDED)
+    
+    (map-set merchants
+      { merchant-address: merchant-address }
+      (merge merchant {
+        business-name: business-name,
+        business-type: business-type,
+        contact-email: contact-email,
+        website: website,
+        description: description,
+        last-activity: stacks-block-height
+      })
+    )
+    
+    (print {
+      event: "merchant-profile-updated",
+      merchant-address: merchant-address
+    })
+    
+    (ok true)
+  )
+)
+
+;; Update merchant settings
+(define-public (update-merchant-settings
+  (auto-settle bool)
+  (settlement-delay uint)
+  (webhook-url (optional (string-ascii 256)))
+  (notification-email (optional (string-ascii 64)))
+  (payment-timeout uint)
+)
+  (let (
+    (merchant-address tx-sender)
+  )
+    (asserts! (is-some (get-merchant merchant-address)) ERR-MERCHANT-NOT-FOUND)
+    (asserts! (<= settlement-delay u144) ERR-INVALID-MERCHANT-DATA) ;; Max 24 hours
+    (asserts! (<= payment-timeout u1440) ERR-INVALID-MERCHANT-DATA) ;; Max 10 days
+    
+    (map-set merchant-settings
+      { merchant-address: merchant-address }
+      {
+        auto-settle: auto-settle,
+        settlement-delay: settlement-delay,
+        webhook-url: webhook-url,
+        notification-email: notification-email,
+        custom-fee-rate: none, ;; Admin only
+        payment-timeout: payment-timeout
+      }
+    )
+    
+    (print {
+      event: "merchant-settings-updated",
+      merchant-address: merchant-address
+    })
+    
+    (ok true)
+  )
+)
+
+;; Request verification
+(define-public (request-verification (documents-hash (buff 32)))
+  (let (
+    (merchant-address tx-sender)
+    (merchant (unwrap! (get-merchant merchant-address) ERR-MERCHANT-NOT-FOUND))
+  )
+    (asserts! (is-eq (get status merchant) STATUS-PENDING) ERR-INVALID-STATUS)
+    
+    (map-set verification-requests
+      { merchant-address: merchant-address }
+      {
+        requested-at: stacks-block-height,
+        verifier: none,
+        verified-at: none,
+        verification-notes: none,
+        documents-hash: (some documents-hash)
+      }
+    )
+    
+    (print {
+      event: "verification-requested",
+      merchant-address: merchant-address,
+      documents-hash: documents-hash
+    })
+    
+    (ok true)
   )
 )
 
