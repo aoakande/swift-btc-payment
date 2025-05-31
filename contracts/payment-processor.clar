@@ -6,6 +6,8 @@
 (define-constant ERR-UNAUTHORIZED (err u100))
 (define-constant ERR-INVALID-PAYMENT (err u101))
 (define-constant ERR-PAYMENT-NOT-FOUND (err u102))
+(define-constant ERR-PAYMENT-ALREADY-PROCESSED (err u103))
+(define-constant ERR-PAYMENT-EXPIRED (err u106))
 (define-constant ERR-INVALID-AMOUNT (err u107))
 
 ;; Payment status constants
@@ -22,6 +24,7 @@
   { payment-id: uint }
   {
     merchant: principal,
+    payer: (optional principal),
     amount: uint,
     sbtc-amount: uint,
     status: uint,
@@ -38,6 +41,13 @@
 
 (define-read-only (get-current-payment-counter)
   (var-get payment-counter)
+)
+
+(define-read-only (is-payment-expired (payment-id uint))
+  (match (get-payment payment-id)
+    payment (> stacks-block-height (get expires-at payment))
+    false
+  )
 )
 
 ;; Private functions
@@ -70,6 +80,7 @@
       { payment-id: payment-id }
       {
         merchant: merchant,
+        payer: none,
         amount: amount,
         sbtc-amount: sbtc-amount,
         status: STATUS-PENDING,
@@ -88,5 +99,34 @@
     })
     
     (ok payment-id)
+  )
+)
+
+;; Process payment (called by payer)
+(define-public (process-payment (payment-id uint))
+  (let (
+    (payment (unwrap! (get-payment payment-id) ERR-PAYMENT-NOT-FOUND))
+    (payer tx-sender)
+  )
+    (asserts! (is-eq (get status payment) STATUS-PENDING) ERR-PAYMENT-ALREADY-PROCESSED)
+    (asserts! (<= stacks-block-height (get expires-at payment)) ERR-PAYMENT-EXPIRED)
+    
+    ;; Update payment status
+    (map-set payments
+      { payment-id: payment-id }
+      (merge payment {
+        payer: (some payer),
+        status: STATUS-CONFIRMED
+      })
+    )
+    
+    (print {
+      event: "payment-processed",
+      payment-id: payment-id,
+      payer: payer,
+      amount: (get sbtc-amount payment)
+    })
+    
+    (ok true)
   )
 )
