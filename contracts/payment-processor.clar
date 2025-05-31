@@ -8,6 +8,7 @@
 (define-constant ERR-PAYMENT-NOT-FOUND (err u102))
 (define-constant ERR-PAYMENT-ALREADY-PROCESSED (err u103))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u104))
+(define-constant ERR-INVALID-MERCHANT (err u105))
 (define-constant ERR-PAYMENT-EXPIRED (err u106))
 (define-constant ERR-INVALID-AMOUNT (err u107))
 
@@ -15,10 +16,13 @@
 (define-constant STATUS-PENDING u0)
 (define-constant STATUS-CONFIRMED u1)
 (define-constant STATUS-SETTLED u2)
+(define-constant STATUS-FAILED u3)
+(define-constant STATUS-EXPIRED u4)
 
 ;; Data Variables
 (define-data-var payment-counter uint u0)
-(define-data-var platform-fee-rate uint u250) ;; 2.5% in basis points
+(define-data-var platform-fee-rate uint u250) ;; 2.5% in basis points (250/10000)
+(define-data-var settlement-timeout uint u144) ;; 144 blocks (~24 hours)
 
 ;; Data Maps
 (define-map payments
@@ -32,7 +36,8 @@
     created-at: uint,
     expires-at: uint,
     settled-at: (optional uint),
-    payment-reference: (string-ascii 64)
+    payment-reference: (string-ascii 64),
+    metadata: (string-ascii 256)
   }
 )
 
@@ -44,12 +49,16 @@
 (define-map payment-settlements
   { payment-id: uint }
   {
+    settlement-tx: (optional (buff 32)),
     settlement-amount: uint,
     platform-fee: uint,
     merchant-amount: uint,
     settled-by: principal
   }
 )
+
+;; Events
+(define-data-var last-event-id uint u0)
 
 ;; Read-only functions
 (define-read-only (get-payment (payment-id uint))
@@ -110,6 +119,7 @@
   (sbtc-amount uint)
   (expires-in-blocks uint)
   (payment-reference (string-ascii 64))
+  (metadata (string-ascii 256))
 )
   (let (
     (payment-id (increment-payment-counter))
@@ -130,7 +140,8 @@
         created-at: stacks-block-height,
         expires-at: expires-at,
         settled-at: none,
-        payment-reference: payment-reference
+        payment-reference: payment-reference,
+        metadata: metadata
       }
     )
     
@@ -142,7 +153,8 @@
       payment-id: payment-id,
       merchant: merchant,
       amount: amount,
-      sbtc-amount: sbtc-amount
+      sbtc-amount: sbtc-amount,
+      expires-at: expires-at
     })
     
     (ok payment-id)
@@ -157,6 +169,10 @@
   )
     (asserts! (is-eq (get status payment) STATUS-PENDING) ERR-PAYMENT-ALREADY-PROCESSED)
     (asserts! (<= stacks-block-height (get expires-at payment)) ERR-PAYMENT-EXPIRED)
+    
+    ;; Transfer sBTC from payer to contract
+    ;; Note: In production, this would integrate with actual sBTC token contract
+    ;; For now, we'll simulate the transfer logic
     
     ;; Update payment status
     (map-set payments
@@ -200,6 +216,7 @@
     (map-set payment-settlements
       { payment-id: payment-id }
       {
+        settlement-tx: none, ;; Will be populated with actual sBTC transfer
         settlement-amount: (get sbtc-amount payment),
         platform-fee: platform-fee,
         merchant-amount: merchant-amount,
@@ -226,6 +243,36 @@
   )
 )
 
+;; Expire payment (can be called by anyone for cleanup)
+(define-public (expire-payment (payment-id uint))
+  (let (
+    (payment (unwrap! (get-payment payment-id) ERR-PAYMENT-NOT-FOUND))
+  )
+    (asserts! (> stacks-block-height (get expires-at payment)) ERR-INVALID-PAYMENT)
+    (asserts! (is-eq (get status payment) STATUS-PENDING) ERR-PAYMENT-ALREADY-PROCESSED)
+    
+    ;; Update payment status
+    (map-set payments
+      { payment-id: payment-id }
+      (merge payment { status: STATUS-EXPIRED })
+    )
+    
+    ;; Release pending balance
+    (update-merchant-balance 
+      (get merchant payment) 
+      0 
+      (- 0 (to-int (get sbtc-amount payment)))
+    )
+    
+    (print {
+      event: "payment-expired",
+      payment-id: payment-id
+    })
+    
+    (ok true)
+  )
+)
+
 ;; Merchant withdrawal function
 (define-public (withdraw-balance (amount uint))
   (let (
@@ -237,12 +284,33 @@
     ;; Update merchant balance
     (update-merchant-balance merchant (- 0 (to-int amount)) 0)
     
+    ;; In production, transfer sBTC to merchant
+    ;; For now, we'll just emit an event
+    
     (print {
       event: "balance-withdrawn",
       merchant: merchant,
       amount: amount
     })
     
+    (ok true)
+  )
+)
+
+;; Admin functions
+(define-public (set-platform-fee-rate (new-rate uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (<= new-rate u1000) ERR-INVALID-PAYMENT) ;; Max 10%
+    (var-set platform-fee-rate new-rate)
+    (ok true)
+  )
+)
+
+(define-public (set-settlement-timeout (new-timeout uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (var-set settlement-timeout new-timeout)
     (ok true)
   )
 )
