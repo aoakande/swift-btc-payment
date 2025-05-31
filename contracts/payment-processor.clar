@@ -30,13 +30,32 @@
     status: uint,
     created-at: uint,
     expires-at: uint,
+    settled-at: (optional uint),
     payment-reference: (string-ascii 64)
+  }
+)
+
+(define-map payment-settlements
+  { payment-id: uint }
+  {
+    settlement-amount: uint,
+    platform-fee: uint,
+    merchant-amount: uint,
+    settled-by: principal
   }
 )
 
 ;; Read-only functions
 (define-read-only (get-payment (payment-id uint))
   (map-get? payments { payment-id: payment-id })
+)
+
+(define-read-only (get-payment-settlement (payment-id uint))
+  (map-get? payment-settlements { payment-id: payment-id })
+)
+
+(define-read-only (calculate-platform-fee (amount uint))
+  (/ (* amount (var-get platform-fee-rate)) u10000)
 )
 
 (define-read-only (get-current-payment-counter)
@@ -86,6 +105,7 @@
         status: STATUS-PENDING,
         created-at: stacks-block-height,
         expires-at: expires-at,
+        settled-at: none,
         payment-reference: payment-reference
       }
     )
@@ -125,6 +145,47 @@
       payment-id: payment-id,
       payer: payer,
       amount: (get sbtc-amount payment)
+    })
+    
+    (ok true)
+  )
+)
+
+;; Settle payment (transfer funds to merchant)
+(define-public (settle-payment (payment-id uint))
+  (let (
+    (payment (unwrap! (get-payment payment-id) ERR-PAYMENT-NOT-FOUND))
+    (platform-fee (calculate-platform-fee (get sbtc-amount payment)))
+    (merchant-amount (- (get sbtc-amount payment) platform-fee))
+  )
+    (asserts! (is-eq (get status payment) STATUS-CONFIRMED) ERR-INVALID-PAYMENT)
+    
+    ;; Update payment status
+    (map-set payments
+      { payment-id: payment-id }
+      (merge payment {
+        status: STATUS-SETTLED,
+        settled-at: (some stacks-block-height)
+      })
+    )
+    
+    ;; Record settlement details
+    (map-set payment-settlements
+      { payment-id: payment-id }
+      {
+        settlement-amount: (get sbtc-amount payment),
+        platform-fee: platform-fee,
+        merchant-amount: merchant-amount,
+        settled-by: tx-sender
+      }
+    )
+    
+    (print {
+      event: "payment-settled",
+      payment-id: payment-id,
+      merchant: (get merchant payment),
+      merchant-amount: merchant-amount,
+      platform-fee: platform-fee
     })
     
     (ok true)
