@@ -69,6 +69,11 @@
   { staked-amount: uint, stake-locked-until: uint }
 )
 
+(define-map merchant-verifiers
+  { verifier: principal }
+  { authorized: bool, verification-count: uint }
+)
+
 (define-map verification-requests
   { merchant-address: principal }
   {
@@ -393,5 +398,76 @@
     })
     
     (ok new-tier)
+  )
+)
+
+;; Admin functions
+
+;; Verify merchant (admin only)
+(define-public (verify-merchant 
+  (merchant-address principal) 
+  (verifier principal)
+  (verification-notes (string-ascii 256))
+)
+  (let (
+    (merchant (unwrap! (get-merchant merchant-address) ERR-MERCHANT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-eq (get status merchant) STATUS-PENDING) ERR-INVALID-STATUS)
+    
+    ;; Update merchant status
+    (map-set merchants
+      { merchant-address: merchant-address }
+      (merge merchant {
+        status: STATUS-VERIFIED,
+        verified-at: (some stacks-block-height)
+      })
+    )
+    
+    ;; Update verification request
+    (map-set verification-requests
+      { merchant-address: merchant-address }
+      (merge 
+        (default-to 
+          { requested-at: stacks-block-height, verifier: none, verified-at: none, verification-notes: none, documents-hash: none }
+          (map-get? verification-requests { merchant-address: merchant-address })
+        )
+        {
+          verifier: (some verifier),
+          verified-at: (some stacks-block-height),
+          verification-notes: (some verification-notes)
+        }
+      )
+    )
+    
+    (print {
+      event: "merchant-verified",
+      merchant-address: merchant-address,
+      verifier: verifier
+    })
+    
+    (ok true)
+  )
+)
+
+;; Suspend merchant (admin only)
+(define-public (suspend-merchant (merchant-address principal) (reason (string-ascii 256)))
+  (let (
+    (merchant (unwrap! (get-merchant merchant-address) ERR-MERCHANT-NOT-FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    
+    (map-set merchants
+      { merchant-address: merchant-address }
+      (merge merchant { status: STATUS-SUSPENDED })
+    )
+    
+    (print {
+      event: "merchant-suspended",
+      merchant-address: merchant-address,
+      reason: reason
+    })
+    
+    (ok true)
   )
 )
