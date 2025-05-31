@@ -7,6 +7,7 @@
 (define-constant ERR-INVALID-PAYMENT (err u101))
 (define-constant ERR-PAYMENT-NOT-FOUND (err u102))
 (define-constant ERR-PAYMENT-ALREADY-PROCESSED (err u103))
+(define-constant ERR-INSUFFICIENT-BALANCE (err u104))
 (define-constant ERR-PAYMENT-EXPIRED (err u106))
 (define-constant ERR-INVALID-AMOUNT (err u107))
 
@@ -35,6 +36,11 @@
   }
 )
 
+(define-map merchant-balances
+  { merchant: principal }
+  { available: uint, pending: uint }
+)
+
 (define-map payment-settlements
   { payment-id: uint }
   {
@@ -48,6 +54,12 @@
 ;; Read-only functions
 (define-read-only (get-payment (payment-id uint))
   (map-get? payments { payment-id: payment-id })
+)
+
+(define-read-only (get-merchant-balance (merchant principal))
+  (default-to { available: u0, pending: u0 }
+    (map-get? merchant-balances { merchant: merchant })
+  )
 )
 
 (define-read-only (get-payment-settlement (payment-id uint))
@@ -74,6 +86,18 @@
   (let ((current (var-get payment-counter)))
     (var-set payment-counter (+ current u1))
     (+ current u1)
+  )
+)
+
+(define-private (update-merchant-balance (merchant principal) (available-delta int) (pending-delta int))
+  (let ((current-balance (get-merchant-balance merchant)))
+    (map-set merchant-balances
+      { merchant: merchant }
+      {
+        available: (+ (get available current-balance) (if (< available-delta 0) u0 (to-uint available-delta))),
+        pending: (+ (get pending current-balance) (if (< pending-delta 0) u0 (to-uint pending-delta)))
+      }
+    )
   )
 )
 
@@ -109,6 +133,9 @@
         payment-reference: payment-reference
       }
     )
+    
+    ;; Update merchant pending balance
+    (update-merchant-balance merchant 0 (to-int sbtc-amount))
     
     (print {
       event: "payment-created",
@@ -180,12 +207,40 @@
       }
     )
     
+    ;; Update merchant balances
+    (update-merchant-balance 
+      (get merchant payment) 
+      (to-int merchant-amount) 
+      (- 0 (to-int (get sbtc-amount payment)))
+    )
+    
     (print {
       event: "payment-settled",
       payment-id: payment-id,
       merchant: (get merchant payment),
       merchant-amount: merchant-amount,
       platform-fee: platform-fee
+    })
+    
+    (ok true)
+  )
+)
+
+;; Merchant withdrawal function
+(define-public (withdraw-balance (amount uint))
+  (let (
+    (merchant tx-sender)
+    (balance (get-merchant-balance merchant))
+  )
+    (asserts! (>= (get available balance) amount) ERR-INSUFFICIENT-BALANCE)
+    
+    ;; Update merchant balance
+    (update-merchant-balance merchant (- 0 (to-int amount)) 0)
+    
+    (print {
+      event: "balance-withdrawn",
+      merchant: merchant,
+      amount: amount
     })
     
     (ok true)
