@@ -5,6 +5,11 @@ authors = []
 telemetry = true
 cache_dir = './.cache'
 requirements = []
+[contracts.merchant-registry]
+path = 'contracts/merchant-registry.clar'
+clarity_version = 3
+epoch = 3.1
+
 [contracts.payment-processor]
 path = 'contracts/payment-processor.clar'
 clarity_version = 3
